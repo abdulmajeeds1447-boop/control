@@ -129,14 +129,6 @@ const App: React.FC = () => {
 
   // Initial Data Fetch
   useEffect(() => {
-    if (firebaseConfig.apiKey === "YOUR_WEB_API_KEY_HERE") {
-        setConnectionError({
-            title: "مفتاح API مفقود",
-            msg: "لم يتم إعداد التطبيق للاتصال بـ Firebase بعد."
-        });
-        setLoading(false);
-        return;
-    }
     fetchData();
   }, []);
 
@@ -416,7 +408,7 @@ const App: React.FC = () => {
     const file = fileInput.files?.[0];
     if (!file) return;
 
-    if(!confirm("سيتم استيراد توزيع الملاحظين وتحديث البيانات الحالية. يجب أن يحتوي ملف الإكسل على الأعمدة: 'اسم المراقب'، 'اللجنة'، 'المادة'، 'التاريخ'. هل تريد المتابعة؟")) {
+    if(!confirm("سيتم استيراد توزيع الملاحظين. يرجى التأكد من وجود الأعمدة التالية في ملف الإكسل:\n- 'اسم المعلم'\n- 'مقر اللجنة' (أو 'رقم اللجنة')\n- 'التاريخ'\n- 'الفترة'\n\nهل تريد المتابعة؟")) {
         fileInput.value = '';
         return;
     }
@@ -434,55 +426,80 @@ const App: React.FC = () => {
         const tempEnvelopes = [...envelopes];
 
         jsonData.forEach((row: any) => {
-            // Extract and clean data
-            const teacherName = (row['اسم المراقب'] || row['المراقب'] || row['Teacher'])?.toString().trim();
-            const commName = (row['اللجنة'] || row['Committee'])?.toString().trim();
-            const subject = (row['المادة'] || row['Subject'])?.toString().trim();
-            // Handle Excel dates (which might be integers or strings)
-            let dateVal = row['التاريخ'] || row['Date'];
+            // 1. Extract Data based on user's screenshot columns
+            const teacherName = (row['اسم المعلم'] || row['اسم المراقب'] || row['المراقب'] || row['Teacher'])?.toString().trim();
             
-            // Basic date parsing logic for Excel serial date or string
+            // Committee: Try Location name first, then Number, then generic 'Committee'
+            const commLocation = (row['مقر اللجنة'] || row['اللجنة'] || row['Committee'])?.toString().trim();
+            const commNumber = row['رقم اللجنة']?.toString().trim();
+
+            // Period: Map 'الأولى'/1 to 'First', etc.
+            const periodRaw = (row['الفترة'] || row['Period'])?.toString().trim();
+            let targetPeriod: string | null = null;
+            if (periodRaw) {
+                if (periodRaw.includes('الأولى') || periodRaw.includes('1') || periodRaw.toLowerCase().includes('first')) targetPeriod = 'First';
+                else if (periodRaw.includes('الثانية') || periodRaw.includes('2') || periodRaw.toLowerCase().includes('second')) targetPeriod = 'Second';
+            }
+
+            // Date Handling
+            let dateVal = row['التاريخ'] || row['Date'];
             if (typeof dateVal === 'number') {
+                 // Excel serial date to YYYY-MM-DD
                  const dateObj = new Date(Math.round((dateVal - 25569)*86400*1000));
                  dateVal = dateObj.toISOString().split('T')[0];
             } else if (dateVal) {
                  dateVal = dateVal.toString().trim();
+                 // Handle specific formats if necessary, assuming YYYY-MM-DD for now as per system standard
             }
 
-            if (teacherName && commName && subject && dateVal) {
-                // 1. Find the User (Proctor)
+            if (teacherName && (commLocation || commNumber) && dateVal) {
+                // A. Find the User (Proctor)
                 const proctor = users.find(u => u.name.trim() === teacherName);
-                // 2. Find the Committee
-                const committee = committees.find(c => c.name.trim() === commName);
+                
+                // B. Find the Committee
+                // Logic: Search for exact name match OR if 'commNumber' exists, check if committee name contains that number
+                const committee = committees.find(c => {
+                    if (commLocation && c.name.includes(commLocation)) return true;
+                    if (commNumber && c.name.includes(commNumber)) return true;
+                    return false;
+                });
 
                 if (proctor && committee) {
-                    // 3. Find the exact exam envelope
-                    const envIndex = tempEnvelopes.findIndex(e => 
+                    // C. Find Envelope(s) matching Date + Committee + Period (Optional)
+                    // If Period is missing in Excel, it might update all exams in that committee on that date
+                    const matchingEnvelopes = tempEnvelopes.filter(e => 
                         e.committeeId === committee.id && 
-                        e.subject.trim() === subject && 
-                        e.date === dateVal
+                        e.date === dateVal &&
+                        (!targetPeriod || e.period === targetPeriod)
                     );
 
-                    if (envIndex !== -1) {
-                        const env = tempEnvelopes[envIndex];
-                        // Update in local array
-                        tempEnvelopes[envIndex] = { 
-                            ...env, 
-                            proctorId: proctor.id, 
-                            proctorName: proctor.name 
-                        };
+                    if (matchingEnvelopes.length > 0) {
+                        matchingEnvelopes.forEach(env => {
+                            // Update local state (find index of this specific envelope)
+                            const idx = tempEnvelopes.findIndex(x => x.id === env.id);
+                            if (idx !== -1) {
+                                tempEnvelopes[idx] = { 
+                                    ...tempEnvelopes[idx], 
+                                    proctorId: proctor.id, 
+                                    proctorName: proctor.name 
+                                };
 
-                        // Add to batch
-                        const ref = doc(db, COLLECTION_NAMES.ENVELOPES, env.id);
-                        batch.update(ref, { 
-                            proctorId: proctor.id, 
-                            proctorName: proctor.name 
+                                // Add to batch
+                                const ref = doc(db, COLLECTION_NAMES.ENVELOPES, env.id);
+                                batch.update(ref, { 
+                                    proctorId: proctor.id, 
+                                    proctorName: proctor.name 
+                                });
+                                updatedCount++;
+                            }
                         });
-                        updatedCount++;
                     } else {
+                        console.log(`No exam found for: ${dateVal}, Comm: ${committee.name}, Period: ${targetPeriod}`);
                         notFoundCount++;
                     }
                 } else {
+                    if (!proctor) console.log(`Proctor not found: ${teacherName}`);
+                    if (!committee) console.log(`Committee not found: ${commLocation || commNumber}`);
                     notFoundCount++;
                 }
             }
@@ -491,10 +508,10 @@ const App: React.FC = () => {
         if (updatedCount > 0) {
             await batch.commit();
             setEnvelopes(tempEnvelopes);
-            alert(`تم تعيين ${updatedCount} مراقب بنجاح!`);
-            if (notFoundCount > 0) alert(`ملاحظة: لم يتم العثور على ${notFoundCount} صفوف (قد تكون البيانات غير مطابقة أو المظاريف غير مولدة).`);
+            alert(`تم تحديث ${updatedCount} تكليف مراقبة بنجاح!`);
+            if (notFoundCount > 0) alert(`ملاحظة: لم يتم مطابقة ${notFoundCount} سجل (تأكد من تطابق الأسماء والتواريخ).`);
         } else {
-            alert("لم يتم تحديث أي بيانات. تأكد من مطابقة الأسماء والتواريخ والمواد.");
+            alert("لم يتم تحديث أي بيانات. تأكد من صحة أسماء المعلمين وأرقام اللجان والتواريخ في الملف.");
         }
 
     } catch (error: any) {
@@ -983,7 +1000,7 @@ const App: React.FC = () => {
      </div>
   );
   
-  // --- COMMITTEES View (Updated) ---
+  // --- COMMITTEES View (Updated with new Import Logic) ---
   const renderCommittees = () => {
      // Filter Logic
      const filteredCommittees = committees.filter(committee => {
