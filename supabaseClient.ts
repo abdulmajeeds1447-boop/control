@@ -1,0 +1,1 @@
+// This file is deprecated. We are now using firebaseConfig.ts

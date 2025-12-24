@@ -1,0 +1,5 @@
+{
+  "name": "Moaqib - Exam Management System",
+  "description": "A comprehensive digital system for managing school examination committees, utilizing barcodes for tracking envelopes and student attendance with role-based access.",
+  "requestFramePermissions": []
+}
